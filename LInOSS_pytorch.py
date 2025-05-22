@@ -15,10 +15,10 @@ def simple_uniform_init(shape, std=1., device=None, dtype=torch.float32):
 
 
 class GLU(nn.Module):
-    def __init__(self, input_size):
+    def __init__(self, input_size, output_size):
         super(GLU, self).__init__()
-        self.l1 = nn.Linear(input_size, input_size)
-        self.l2 = nn.Linear(input_size, input_size)
+        self.l1 = nn.Linear(input_size, output_size, bias=True)
+        self.l2 = nn.Linear(input_size, output_size, bias=True)
 
     def forward(self, x):
         return self.l1(x) * self.l2(x).sigmoid()
@@ -213,29 +213,104 @@ class LinOSSLayer(nn.Module):
         return ys + Du
 
 
-# Parameters
-T = 10        # sequence length
-H = 4         # input/output dimension
-ssm_size = 6  # internal state size
 
-# Create input sequence: [T, H]
-input_sequence = torch.randn(T, H)
+# H --> hidden layer dimension
+class LinOSSBlock(nn.Module):
+    def __init__(self, ssm_size, H, discretization, drop_rate=0.05):
+        super().__init__()
+        self.norm = nn.BatchNorm1d(H, affine=False)
+        self.ssm = LinOSSLayer(ssm_size, H, discretization)
+        self.glu = GLU(H, H)
+        self.drop = nn.Dropout(drop_rate)
 
-# Initialize layer
-layer = LinOSSLayer(ssm_size=ssm_size, H=H, discretization='IMEX')
+    def forward(self, x):
+        """
 
-# Forward pass
-output = layer(input_sequence)
+        :param x: (batch_dim, seq_len, hidden_dim)
+        """
+        skip = x
+        # Applying BatchNorm
+        x = x.transpose(1, 2)   # (B, H, T)
+        x = self.norm(x)
+        x = x.transpose(1, 2)   # (B, T, H)
 
-# Show output
-print("Input:")
-print(input_sequence)
-print("\nOutput:")
-print(output)
+        # Main...
+        x = torch.stack([self.ssm(xi) for xi in x], dim=0)
+        x = self.drop(F.gelu(x))
+        x = self.glu(x)
+        x = self.drop(x)
+
+        x = x + skip
+
+        return x
 
 
+# N ---> input dimension
+# H ---> hidden layer dimension
+# O ---> output dimension
+class LinOSS(nn.Module):
+    def __init__(self, num_block, N, ssm_size, H, O, classification, output_step, discretization, drop_rate=0.05):
+        super().__init__()
+        self.l1 = nn.Linear(N, H)
+        self.blocks = nn.ModuleList([
+            LinOSSBlock(ssm_size, H, discretization, drop_rate)
+            for _ in range(num_block)
+        ])
+        self.l2 = nn.Linear(H, O)
+        self.classification = classification
+        self.output_step = output_step
+
+    def forward(self, x):
+        """
+        x: (batch_size, seq_len, input_dim)
+        returns: (batch_size, output_dim) if classification,
+                         or (batch_size, num_outputs, output_dim) otherwise
+        """
+        batch_size, seq_len = x.size
+
+        x = self.l1(x)
+
+        for block in self.blocks:
+            x = block(x)
+
+        if self.classification:
+            # (B, T, H) --> (B, H)
+            x = x.mean(dim=1)
+            x = self.l2(x)
+            x = F.softmax(x, dim=-1)
+        else:
+            x = x[:, self.output_step - 1 :: self.output_step, :]
+            x = self.l2(x)
+            x = torch.tanh(x)
+
+        return x
 
 
+if __name__ == "__main__":
+    torch.manual_seed(42)
+
+    batch_size = 4
+    seq_len = 50
+    hidden_dim = 64
+    ssm_size = 128
+
+    # Create test input
+    x = torch.randn(batch_size, seq_len, hidden_dim)
+
+    # Instantiate LinOSSBlock
+    block = LinOSSBlock(
+        ssm_size=ssm_size,
+        H=hidden_dim,
+        discretization="IM",
+        drop_rate=0.1
+    )
+
+    # Run forward pass
+    output = block(x)
+
+    # Print outputs
+    print("Output shape:", output.shape)
+    print("Output sample:", output[0, :3])
 
 
 
